@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import argparse
 import cv2
@@ -30,6 +30,13 @@ parser.add_argument('--skip', dest='skip', action='store', default=None, help='S
 
 args = parser.parse_args()
 
+if args.quiet and args.bbox is None and not args.challenge:
+	parser.error('--quiet requires --bbox=x,y,width,height')
+if args.quiet and args.preview:
+	parser.error('--quiet cannot be combined with --preview')
+if args.skip is not None and args.skip < 0:
+	parser.error('--skip must be non-negative')
+
 CMT.estimate_scale = args.estimate_scale
 CMT.estimate_rotation = args.estimate_rotation
 
@@ -40,7 +47,7 @@ else:
 
 if args.output is not None:
 	if not os.path.exists(args.output):
-		os.mkdir(args.output)
+		os.makedirs(args.output)
 	elif not os.path.isdir(args.output):
 		raise Exception(args.output + ' exists, but is not a directory')
 
@@ -66,6 +73,7 @@ if args.challenge:
 
 	try:
 		CMT.initialise(im_gray0, tl, br)
+		frame = 1
 		while frame < num_frames:
 			im = cv2.imread(images[frame])
 			im_gray = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
@@ -74,14 +82,17 @@ if args.challenge:
 
 			# Advance frame number
 			frame += 1
-	except:
-		pass  # Swallow errors
+	except Exception as exc:
+		np.savetxt('output.txt', results, delimiter=',')
+		print('Tracking failed: {}'.format(exc), file=sys.stderr)
+		sys.exit(1)
 
 	np.savetxt('output.txt', results, delimiter=',')
 
 else:
 	# Clean up
-	cv2.destroyAllWindows()
+	if not args.quiet:
+		cv2.destroyAllWindows()
 
 	preview = args.preview
 
@@ -93,7 +104,7 @@ else:
 
 			#Skip first frames if required
 			if args.skip is not None:
-				cap.set(cv2.cv.CV_CAP_PROP_POS_FRAMES, args.skip)
+				cap.set(cv2.CAP_PROP_POS_FRAMES, args.skip)
 
 
 		# Otherwise assume it is a format string for reading images
@@ -112,15 +123,17 @@ else:
 		# If no input path was specified, open camera device
 		cap = cv2.VideoCapture(0)
 		if preview is None:
-			preview = True
+			preview = not args.quiet
 
 	# Check if videocapture is working
 	if not cap.isOpened():
-		print 'Unable to open video input.'
+		print('Unable to open video input.', file=sys.stderr)
 		sys.exit(1)
 
 	while preview:
 		status, im = cap.read()
+		if not status:
+			break
 		cv2.imshow('Preview', im)
 		k = cv2.waitKey(10)
 		if not k == -1:
@@ -128,6 +141,10 @@ else:
 
 	# Read first frame
 	status, im0 = cap.read()
+	if not status:
+		print('Unable to read the first frame; check the input and --skip.', file=sys.stderr)
+		cap.release()
+		sys.exit(1)
 	im_gray0 = cv2.cvtColor(im0, cv2.COLOR_BGR2GRAY)
 	im_draw = np.copy(im0)
 
@@ -140,6 +157,9 @@ else:
 			raise Exception('Unable to parse bounding box')
 		if len(values) != 4:
 			raise Exception('Bounding box must have exactly 4 elements')
+		x, y, width, height = values
+		if x < 0 or y < 0 or width <= 0 or height <= 0 or x + width > im0.shape[1] or y + height > im0.shape[0]:
+			parser.error('Bounding box must have positive width/height and fit inside the first frame')
 		bbox = np.array(values)
 
 		# Convert to point representation, adding singleton dimension
@@ -154,7 +174,7 @@ else:
 		# Get rectangle input from user
 		(tl, br) = util.get_rect(im_draw)
 
-	print 'using', tl, br, 'as init bb'
+	print('using', tl, br, 'as init bb')
 
 
 	CMT.initialise(im_gray0, tl, br)
@@ -212,7 +232,8 @@ else:
 			with open('{0}/bbox_{1:08d}.csv'.format(args.output, frame), 'w') as f:
 				f.write('x y\n')
 				# Duplicate entry tl is not a mistake, as it is used as a drawing instruction
-				np.savetxt(f, np.array((CMT.tl, CMT.tr, CMT.br, CMT.bl, CMT.tl)), fmt='%.2f')
+				corners = np.array((CMT.tl, CMT.tr, CMT.br, CMT.bl, CMT.tl)) if CMT.has_result else np.full((5, 2), np.nan)
+				np.savetxt(f, corners, fmt='%.2f')
 
 		if not args.quiet:
 			cv2.imshow('main', im_draw)
@@ -231,4 +252,8 @@ else:
 		# Advance frame number
 		frame += 1
 
-		print '{5:04d}: center: {0:.2f},{1:.2f} scale: {2:.2f}, active: {3:03d}, {4:04.0f}ms'.format(CMT.center[0], CMT.center[1], CMT.scale_estimate, CMT.active_keypoints.shape[0], 1000 * (toc - tic), frame)
+		print('{5:04d}: center: {0:.2f},{1:.2f} scale: {2:.2f}, active: {3:03d}, {4:04.0f}ms'.format(CMT.center[0], CMT.center[1], CMT.scale_estimate, CMT.active_keypoints.shape[0], 1000 * (toc - tic), frame))
+
+	cap.release()
+	if not args.quiet:
+		cv2.destroyAllWindows()

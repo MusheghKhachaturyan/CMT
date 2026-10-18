@@ -1,6 +1,7 @@
 import cv2
 import itertools
-from numpy import array, zeros, vstack, hstack, math, nan, argsort, median, \
+import math
+from numpy import array, zeros, vstack, hstack, nan, argsort, median, \
 	argmax, isnan, append
 import scipy.cluster
 import scipy.spatial
@@ -26,8 +27,8 @@ class CMT(object):
 	def initialise(self, im_gray0, tl, br):
 
 		# Initialise detector, descriptor, matcher
-		self.detector = cv2.FeatureDetector_create(self.DETECTOR)
-		self.descriptor = cv2.DescriptorExtractor_create(self.DESCRIPTOR)
+		self.detector = getattr(cv2, self.DETECTOR + '_create')()
+		self.descriptor = getattr(cv2, self.DESCRIPTOR + '_create')()
 		self.matcher = cv2.DescriptorMatcher_create(self.MATCHER)
 
 		# Get initial keypoints in whole image
@@ -53,7 +54,8 @@ class CMT(object):
 		background_classes = zeros(len(background_keypoints_cv))
 
 		# Stack background features and selected features into database
-		self.features_database = vstack((background_features, self.selected_features))
+		self.features_database = (self.selected_features.copy() if background_features is None
+			else vstack((background_features, self.selected_features)))
 
 		# Same for classes
 		self.database_classes = hstack((background_classes, self.selected_classes))
@@ -107,12 +109,14 @@ class CMT(object):
 		center = array((nan, nan))
 		scale_estimate = nan
 		med_rot = nan
+		self.votes = zeros((0, 2))
+		self.outliers = zeros((0, 3))
 
 		# At least 2 keypoints are needed for scale
-		if keypoints.size > 1:
+		if keypoints.shape[0] > 1:
 
 			# Extract the keypoint classes
-			keypoint_classes = keypoints[:, 2].squeeze().astype(np.int) 
+			keypoint_classes = keypoints[:, 2].squeeze().astype(int)
 
 			# Retain singular dimension
 			if keypoint_classes.size == 1:
@@ -154,7 +158,9 @@ class CMT(object):
 
 				original_dists = self.squareform[class_ind1, class_ind2]
 
-				scalechange = dists / original_dists
+				# Coincident initial keypoints cannot provide a scale estimate.
+				valid_dists = original_dists > 0
+				scalechange = dists[valid_dists] / original_dists[valid_dists]
 
 				# Compute angles
 				angles = np.empty((pts_allcombs0.shape[0]))
@@ -171,7 +177,7 @@ class CMT(object):
 
 				angle_diffs[long_way_angles] = angle_diffs[long_way_angles] - np.sign(angle_diffs[long_way_angles]) * 2 * math.pi
 
-				scale_estimate = median(scalechange)
+				scale_estimate = median(scalechange) if scalechange.size else 1.0
 				if not self.estimate_scale:
 					scale_estimate = 1;
 
@@ -179,7 +185,7 @@ class CMT(object):
 				if not self.estimate_rotation:
 					med_rot = 0;
 
-				keypoint_class = keypoints[:, 2].astype(np.int)
+				keypoint_class = keypoints[:, 2].astype(int)
 				votes = keypoints[:, :2] - scale_estimate * (util.rotate(self.springs[keypoint_class - 1], med_rot))
 
 				# Remember all votes including outliers
@@ -231,7 +237,8 @@ class CMT(object):
 		active_keypoints = zeros((0, 3)) 
 
 		# Get the best two matches for each feature
-		matches_all = self.matcher.knnMatch(features, self.features_database, 2)
+		matches_all = (self.matcher.knnMatch(features, self.features_database, 2)
+			if features is not None else [])
 		# Get all matches for selected features
 		if not any(isnan(center)):
 			selected_matches_all = self.matcher.knnMatch(features, self.selected_features, len(self.selected_features))
@@ -248,6 +255,8 @@ class CMT(object):
 				# First: Match over whole image
 				# Compute distances to all descriptors
 				matches = matches_all[i]
+				if len(matches) < 2:
+					continue
 				distances = np.array([m.distance for m in matches])
 
 				# Convert distances to confidences, do not weight
@@ -260,7 +269,7 @@ class CMT(object):
 				secondBestInd = matches[1].trainIdx
 
 				# Compute distance ratio according to Lowe
-				ratio = (1 - combined[0]) / (1 - combined[1])
+				ratio = distances[0] / distances[1] if distances[1] else 1.0
 
 				# Extract class of best match
 				keypoint_class = classes[bestInd]
@@ -307,7 +316,8 @@ class CMT(object):
 					secondBestInd = sorted_conf[1]
 
 					# Compute distance ratio according to Lowe
-					ratio = (1 - combined[bestInd]) / (1 - combined[secondBestInd])
+					denominator = 1 - combined[secondBestInd]
+					ratio = (1 - combined[bestInd]) / denominator if denominator else 1.0
 
 					# Extract class of best match
 					keypoint_class = classes[bestInd]
@@ -336,7 +346,7 @@ class CMT(object):
 
 				# Add all tracked keypoints that have not been matched
 				associated_classes = active_keypoints[:, 2]
-				missing = ~np.in1d(tracked_classes, associated_classes)
+				missing = ~np.isin(tracked_classes, associated_classes)
 				active_keypoints = append(active_keypoints, tracked_keypoints[missing, :], axis=0)
 
 			# Else use all tracked keypoints

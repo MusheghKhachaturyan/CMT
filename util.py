@@ -1,5 +1,6 @@
 import cv2
-from numpy import math, hstack
+import math
+from numpy import hstack
 
 import numpy as np
 
@@ -12,14 +13,17 @@ class FileVideoCapture(object):
 
 	def isOpened(self):
 		im = cv2.imread(self.path.format(self.frame))
-		return im != None
+		return im is not None
 
 	def read(self):
 		im = cv2.imread(self.path.format(self.frame))
-		status = im != None
+		status = im is not None
 		if status:
 			self.frame += 1
 		return status, im
+
+	def release(self):
+		pass
 
 def squeeze_pts(X):
 	X = X.squeeze()
@@ -80,7 +84,7 @@ def get_rect(im, title='get_rect'):
 	return (tl, br)
 
 def in_rect(keypoints, tl, br):
-	if type(keypoints) is list:
+	if isinstance(keypoints, (list, tuple)):
 		keypoints = keypoints_cv_to_np(keypoints)
 
 	x = keypoints[:, 0]
@@ -96,13 +100,13 @@ def in_rect(keypoints, tl, br):
 	return result
 
 def keypoints_cv_to_np(keypoints_cv):
-	keypoints = np.array([k.pt for k in keypoints_cv])
+	keypoints = np.array([k.pt for k in keypoints_cv], dtype=float).reshape(-1, 2)
 	return keypoints
 
 def find_nearest_keypoints(keypoints, pos, number=1):
 	if type(pos) is tuple:
 		pos = np.array(pos)
-	if type(keypoints) is list:
+	if isinstance(keypoints, (list, tuple)):
 		keypoints = keypoints_cv_to_np(keypoints)
 
 	pos_to_keypoints = np.sqrt(np.power(keypoints - pos, 2).sum(axis=1))
@@ -119,7 +123,7 @@ def draw_keypoints(keypoints, im, color=(255, 0, 0)):
 		cv2.circle(im, center, radius, color)
 
 def track(im_prev, im_gray, keypoints, THR_FB=20):
-	if type(keypoints) is list:
+	if isinstance(keypoints, (list, tuple)):
 		keypoints = keypoints_cv_to_np(keypoints)
 
 	num_keypoints = keypoints.shape[0]
@@ -145,21 +149,21 @@ def track(im_prev, im_gray, keypoints, THR_FB=20):
 		pts_back = squeeze_pts(pts_back)
 		pts = squeeze_pts(pts)
 		nextPts = squeeze_pts(nextPts)
-		status = status.squeeze()
+		status = status.reshape(-1)
 
 		# Calculate forward-backward error
 		fb_err = np.sqrt(np.power(pts_back - pts, 2).sum(axis=1))
 
 		# Set status depending on fb_err and lk error
 		large_fb = fb_err > THR_FB
-		status = ~large_fb & status.astype(np.bool)
+		status = ~large_fb & status.astype(bool)
 
 		nextPts = nextPts[status, :]
 		keypoints_tracked = keypoints[status, :]
 		keypoints_tracked[:, :2] = nextPts
 
 	else:
-		keypoints_tracked = np.array([])
+		keypoints_tracked = np.empty((0, 3))
 	return keypoints_tracked, status
 
 def rotate(pt, rad):

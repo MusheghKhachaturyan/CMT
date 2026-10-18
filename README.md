@@ -23,19 +23,85 @@ If you use our algorithm in scientific work, please cite our publication
 ```
 
 # Dependencies
-* Python
-* OpenCV-Python (>= 2.4, < 3)
+* Python 3.10 or newer (tested with Python 3.12)
+* OpenCV-Python 4
 * NumPy
 * SciPy
 * optional: ipdb (for debugging the code)
 
-Note for Windows users: if you are unable to read video files, please follow this suggestion: http://stackoverflow.com/questions/11699298/opencv-2-4-videocapture-not-working-on-windows
+## Setup and quick start (Linux / WSL)
+
+From the project directory:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python run.py --help
+```
+
+Create and track a sample video without a camera or display:
+
+```bash
+python make_demo.py
+python run.py demo/input.avi --bbox=50,50,100,80 --quiet --output-dir demo/output
+```
+
+The sample contains 61 frames. The first frame initializes the tracker and the
+remaining 60 frames are tracked. Annotated frames are written to
+`demo/output/output_00000001.png` through `output_00000060.png`, alongside the
+input images and CSV files for keypoints, outliers, votes, and bounding boxes.
+The sample is synthetic; it checks that the pipeline works and is not a benchmark
+of tracking quality on real footage.
+
+For your own video, supply the initial object's bounding box in pixels:
+
+```bash
+python run.py /absolute/path/to/video.mp4 --bbox=123,85,60,140
+```
+
+The box format is `x,y,width,height`, measured from the top left of the first
+frame. With a working desktop display you can omit `--bbox` and select two
+corners with the mouse. Press `q` to quit the tracking window. For a terminal
+without a display, use both `--quiet` and `--bbox`:
+
+```bash
+python run.py /absolute/path/to/video.mp4 --bbox=123,85,60,140 --quiet --output-dir output
+```
+
+For a webcam, run `python run.py`. Press any key to stop the preview, then select
+the object. The camera must be accessible to Linux; WSL may require camera
+passthrough. A video file works without a camera.
+
+## CPU / GPU
+
+This implementation runs tracking on the **CPU**. It uses BRISK features,
+Hamming descriptor matching, Lucas–Kanade optical flow, NumPy arrays, and SciPy
+clustering. It does not use `cv2.cuda`, CUDA device memory, PyTorch, or CuPy, and
+there is no GPU command-line switch. Having an NVIDIA GPU or installing CUDA
+does not move this algorithm to the GPU. GPU acceleration would require code
+changes and an appropriate GPU-enabled OpenCV build.
+
+The compatibility updates in this checkout support Python 3 and OpenCV 4;
+the original upstream implementation targeted Python 2 and OpenCV 2.4.
+
+## Validation
+
+Run the regression checks from the project directory after activating `.venv`:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+These checks cover known object motion, selecting the full frame, a single
+remaining keypoint, and tracking loss/recovery through the headless image
+sequence runner.
 
 # Usage
 ```
 usage: run.py [-h] [--challenge] [--preview] [--no-preview] [--no-scale]
-               [--no-rotation] [--bbox BBOX] [--pause] [--output-dir OUTPUT]
-               [--quiet]
+               [--with-rotation] [--bbox BBOX] [--pause] [--output-dir OUTPUT]
+               [--quiet] [--skip SKIP]
                [inputpath]
 ```
 
