@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import json
 import cv2
 from numpy import empty, nan
 import os
@@ -10,9 +11,9 @@ import time
 import CMT
 import numpy as np
 import util
+from backend import BackendError
+from tracking_output import draw_and_write
 
-
-CMT = CMT.CMT()
 
 parser = argparse.ArgumentParser(description='Track an object.')
 
@@ -27,6 +28,10 @@ parser.add_argument('--pause', dest='pause', action='store_true', help='Pause af
 parser.add_argument('--output-dir', dest='output', help='Specify a directory for output data.')
 parser.add_argument('--quiet', dest='quiet', action='store_true', help='Do not show graphical output (Useful in combination with --output-dir ).')
 parser.add_argument('--skip', dest='skip', action='store', default=None, help='Skip the first n frames', type=int)
+parser.add_argument('--backend', choices=('cpu', 'cupy', 'auto'), default='cpu', help='Numerical backend (default: cpu)')
+parser.add_argument('--device', type=int, default=0, help='CUDA device index (default: 0)')
+parser.add_argument('--gpu-memory-mb', type=float, default=256, help='Temporary GPU workspace budget in MiB')
+parser.add_argument('--profile', action='store_true', help='Report synchronized stage timings to stderr as JSON')
 
 args = parser.parse_args()
 
@@ -36,6 +41,21 @@ if args.quiet and args.preview:
 	parser.error('--quiet cannot be combined with --preview')
 if args.skip is not None and args.skip < 0:
 	parser.error('--skip must be non-negative')
+
+try:
+	CMT = CMT.CMT(backend=args.backend, device=args.device, gpu_memory_mb=args.gpu_memory_mb)
+except (BackendError, ValueError) as exc:
+	parser.error(str(exc))
+CMT.profile.enabled = args.profile
+if args.backend != 'cpu' or args.profile:
+	print('Backend: ' + json.dumps(CMT._backend.diagnostics()), file=sys.stderr)
+
+
+def report_profile(frame):
+	if args.profile:
+		print(json.dumps(dict(frame=frame, geometry_route=CMT.geometry_route,
+			profile=CMT.profile.snapshot(), memory=CMT._backend.memory())), file=sys.stderr)
+
 
 CMT.estimate_scale = args.estimate_scale
 CMT.estimate_rotation = args.estimate_rotation
@@ -73,11 +93,13 @@ if args.challenge:
 
 	try:
 		CMT.initialise(im_gray0, tl, br)
+		report_profile(0)
 		frame = 1
 		while frame < num_frames:
 			im = cv2.imread(images[frame])
 			im_gray = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
 			CMT.process_frame(im_gray)
+			report_profile(frame)
 			results[frame, :] = CMT.bb
 
 			# Advance frame number
@@ -178,6 +200,7 @@ else:
 
 
 	CMT.initialise(im_gray0, tl, br)
+	report_profile(0)
 
 	frame = 1
 	while True:
@@ -188,52 +211,17 @@ else:
 		im_gray = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
 		im_draw = np.copy(im)
 
-		tic = time.time()
+		CMT.synchronize()
+		tic = time.perf_counter()
 		CMT.process_frame(im_gray)
-		toc = time.time()
+		CMT.synchronize()
+		toc = time.perf_counter()
 
 		# Display results
 
-		# Draw updated estimate
-		if CMT.has_result:
-
-			cv2.line(im_draw, CMT.tl, CMT.tr, (255, 0, 0), 4)
-			cv2.line(im_draw, CMT.tr, CMT.br, (255, 0, 0), 4)
-			cv2.line(im_draw, CMT.br, CMT.bl, (255, 0, 0), 4)
-			cv2.line(im_draw, CMT.bl, CMT.tl, (255, 0, 0), 4)
-
-		util.draw_keypoints(CMT.tracked_keypoints, im_draw, (255, 255, 255))
-		# this is from simplescale
-		util.draw_keypoints(CMT.votes[:, :2], im_draw)  # blue
-		util.draw_keypoints(CMT.outliers[:, :2], im_draw, (0, 0, 255))
-
-		if args.output is not None:
-			# Original image
-			cv2.imwrite('{0}/input_{1:08d}.png'.format(args.output, frame), im)
-			# Output image
-			cv2.imwrite('{0}/output_{1:08d}.png'.format(args.output, frame), im_draw)
-
-			# Keypoints
-			with open('{0}/keypoints_{1:08d}.csv'.format(args.output, frame), 'w') as f:
-				f.write('x y\n')
-				np.savetxt(f, CMT.tracked_keypoints[:, :2], fmt='%.2f')
-
-			# Outlier
-			with open('{0}/outliers_{1:08d}.csv'.format(args.output, frame), 'w') as f:
-				f.write('x y\n')
-				np.savetxt(f, CMT.outliers, fmt='%.2f')
-
-			# Votes
-			with open('{0}/votes_{1:08d}.csv'.format(args.output, frame), 'w') as f:
-				f.write('x y\n')
-				np.savetxt(f, CMT.votes, fmt='%.2f')
-
-			# Bounding box
-			with open('{0}/bbox_{1:08d}.csv'.format(args.output, frame), 'w') as f:
-				f.write('x y\n')
-				# Duplicate entry tl is not a mistake, as it is used as a drawing instruction
-				corners = np.array((CMT.tl, CMT.tr, CMT.br, CMT.bl, CMT.tl)) if CMT.has_result else np.full((5, 2), np.nan)
-				np.savetxt(f, corners, fmt='%.2f')
+		with CMT.profile.stage('drawing_output'):
+			draw_and_write(CMT, im, im_draw, args.output, frame)
+		report_profile(frame)
 
 		if not args.quiet:
 			cv2.imshow('main', im_draw)

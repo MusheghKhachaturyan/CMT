@@ -14,11 +14,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class TrackingTests(unittest.TestCase):
+    tracker_backend = 'cpu'
+
     def setUp(self):
         self.image = np.full((120, 160), 40, dtype=np.uint8)
         texture = np.random.default_rng(7).integers(0, 256, (16, 20), dtype=np.uint8)
         self.image[35:83, 30:90] = cv2.resize(texture, (60, 48), interpolation=cv2.INTER_NEAREST)
-        self.tracker = CMT()
+        self.tracker = CMT(backend=self.tracker_backend)
         self.tracker.estimate_rotation = False
 
     def test_tracks_known_translation(self):
@@ -51,12 +53,27 @@ class TrackingTests(unittest.TestCase):
             result = subprocess.run([
                 sys.executable, str(ROOT / 'run.py'), str(directory / '{:03d}.png'),
                 '--bbox=25,30,75,60', '--quiet', '--output-dir', str(directory / 'output'),
+                '--backend', self.tracker_backend,
             ], capture_output=True, text=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             boxes = sorted((directory / 'output').glob('bbox_*.csv'))
             self.assertEqual(len(boxes), len(frames) - 1)
             self.assertTrue(np.isnan(np.loadtxt(boxes[2], skiprows=1)).all())
             self.assertTrue(np.isfinite(np.loadtxt(boxes[-1], skiprows=1)).all())
+
+    def test_captured_cpu_tracking_reference(self):
+        reference = np.load(ROOT / 'tests/fixtures/tracking_reference.npz')
+        self.tracker.initialise(self.image, (25, 30), (100, 90))
+        for frame, (dx, dy) in enumerate(((2, 1), (4, 2), (6, 3))):
+            shifted = cv2.warpAffine(self.image, np.float32([[1, 0, dx], [0, 1, dy]]), (160, 120), borderValue=40)
+            self.tracker.process_frame(shifted)
+            for name in ('active_keypoints', 'tracked_keypoints', 'votes', 'outliers', 'bb', 'center', 'scale_estimate', 'rotation_estimate'):
+                actual = np.asarray(getattr(self.tracker, name))
+                expected = reference[f'{frame}_{name}']
+                if name in ('active_keypoints', 'tracked_keypoints', 'outliers'):
+                    np.testing.assert_array_equal(actual[:, 2], expected[:, 2])
+                np.testing.assert_array_equal(np.isnan(actual), np.isnan(expected))
+                np.testing.assert_allclose(actual, expected, rtol=1e-7, atol=1e-6)
 
 
 if __name__ == '__main__':

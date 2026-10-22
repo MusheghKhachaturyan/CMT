@@ -1,0 +1,4 @@
+# Optional CUDA 12 environment. Install only one CuPy distribution.
+-r requirements.txt
+-c constraints-gpu.txt
+cupy-cuda12x[ctk]>=14.2,<15

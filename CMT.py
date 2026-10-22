@@ -9,6 +9,8 @@ import time
 
 import numpy as np
 import util
+from backend import Backend
+from profiling import Profile
 
 
 class CMT(object):
@@ -24,7 +26,36 @@ class CMT(object):
 	estimate_scale = True
 	estimate_rotation = True
 
+	def __init__(self, backend='cpu', device=0, *, gpu_memory_mb=256):
+		self.profile = Profile()
+		self._backend = Backend(backend, device, gpu_memory_mb, self.profile)
+		self._gpu_model = None
+		self.geometry_route = 'cpu'
+
+	@property
+	def backend(self):
+		return self._backend.name
+
+	def synchronize(self):
+		self._backend.synchronize()
+
 	def initialise(self, im_gray0, tl, br):
+		self._gpu_model = None
+		self.profile.reset()
+		with self.profile.stage('initialization'):
+			self._initialise_cpu(im_gray0, tl, br)
+		if self.backend == 'cupy':
+			try:
+				if self.DESC_LENGTH != 512:
+					raise ValueError('CuPy backend supports 512-bit BRISK descriptors')
+				with self.profile.stage('model_upload'):
+					self._gpu_model = self._backend.upload_model(
+						self.features_database, self.database_classes, self.springs,
+						self.squareform, self.angles, self.num_initial_keypoints)
+			except Exception as exc:
+				self._backend.startup_failure(exc)
+
+	def _initialise_cpu(self, im_gray0, tl, br):
 
 		# Initialise detector, descriptor, matcher
 		self.detector = getattr(cv2, self.DETECTOR + '_create')()
@@ -105,6 +136,32 @@ class CMT(object):
 		self.num_initial_keypoints = len(selected_keypoints_cv)
 
 	def estimate(self, keypoints):
+		if self.backend == 'cupy':
+			return self._estimate_cupy(keypoints)
+		self.geometry_route = 'cpu'
+		return self._estimate_cpu(keypoints)
+
+	def _estimate_cupy(self, keypoints):
+		from gpu_geometry import pair_pose
+		self.votes = zeros((0, 2))
+		self.outliers = zeros((0, 3))
+		self.geometry_route = 'cupy'
+		if len(keypoints) < 2:
+			return array((nan, nan)), nan, nan, keypoints
+		if not self._backend.geometry_fits(keypoints, self.estimate_scale, self.estimate_rotation):
+			self.geometry_route = 'cpu-memory'
+			return self._estimate_cpu(keypoints)
+		classes = keypoints[:, 2].astype(int)
+		keypoints = keypoints[argsort(classes)]
+		with self.profile.stage('pair_geometry'):
+			scale, rotation = pair_pose(self._backend, self._gpu_model, keypoints,
+				self.estimate_scale, self.estimate_rotation)
+		if isnan(scale):
+			return array((nan, nan)), nan, nan, keypoints
+		center, keypoints = self._vote_and_cluster(keypoints, scale, rotation)
+		return center, scale, rotation, keypoints
+
+	def _estimate_cpu(self, keypoints):
 
 		center = array((nan, nan))
 		scale_estimate = nan
@@ -127,213 +184,137 @@ class CMT(object):
 			keypoints = keypoints[ind_sort]
 			keypoint_classes = keypoint_classes[ind_sort]
 
-			# Get all combinations of keypoints
-			all_combs = array([val for val in itertools.product(range(keypoints.shape[0]), repeat=2)])	
+			with self.profile.stage('pair_geometry'):
+				# Get all combinations of keypoints
+				all_combs = array([val for val in itertools.product(range(keypoints.shape[0]), repeat=2)])
 
-			# But exclude comparison with itself
-			all_combs = all_combs[all_combs[:, 0] != all_combs[:, 1], :]
+				# But exclude comparison with itself
+				all_combs = all_combs[all_combs[:, 0] != all_combs[:, 1], :]
 
-			# Measure distance between allcombs[0] and allcombs[1]
-			ind1 = all_combs[:, 0] 
-			ind2 = all_combs[:, 1]
+				# Measure distance between allcombs[0] and allcombs[1]
+				ind1 = all_combs[:, 0]
+				ind2 = all_combs[:, 1]
 
-			class_ind1 = keypoint_classes[ind1] - 1
-			class_ind2 = keypoint_classes[ind2] - 1
+				class_ind1 = keypoint_classes[ind1] - 1
+				class_ind2 = keypoint_classes[ind2] - 1
 
-			duplicate_classes = class_ind1 == class_ind2
+				duplicate_classes = class_ind1 == class_ind2
 
+				if not all(duplicate_classes):
+					ind1 = ind1[~duplicate_classes]
+					ind2 = ind2[~duplicate_classes]
+
+					class_ind1 = class_ind1[~duplicate_classes]
+					class_ind2 = class_ind2[~duplicate_classes]
+
+					pts_allcombs0 = keypoints[ind1, :2]
+					pts_allcombs1 = keypoints[ind2, :2]
+
+					# This distance might be 0 for some combinations,
+					# as it can happen that there is more than one keypoint at a single location
+					dists = util.L2norm(pts_allcombs0 - pts_allcombs1)
+
+					original_dists = self.squareform[class_ind1, class_ind2]
+
+					# Coincident initial keypoints cannot provide a scale estimate.
+					valid_dists = original_dists > 0
+					scalechange = dists[valid_dists] / original_dists[valid_dists]
+
+					# Compute angles
+					angles = np.empty((pts_allcombs0.shape[0]))
+
+					v = pts_allcombs1 - pts_allcombs0
+					angles = np.arctan2(v[:, 1], v[:, 0])
+
+					original_angles = self.angles[class_ind1, class_ind2]
+
+					angle_diffs = angles - original_angles
+
+					# Fix long way angles
+					long_way_angles = np.abs(angle_diffs) > math.pi
+
+					angle_diffs[long_way_angles] = angle_diffs[long_way_angles] - np.sign(angle_diffs[long_way_angles]) * 2 * math.pi
+
+					scale_estimate = median(scalechange) if scalechange.size else 1.0
+					if not self.estimate_scale:
+						scale_estimate = 1;
+
+					med_rot = median(angle_diffs)
+					if not self.estimate_rotation:
+						med_rot = 0;
 			if not all(duplicate_classes):
-				ind1 = ind1[~duplicate_classes]
-				ind2 = ind2[~duplicate_classes]
-
-				class_ind1 = class_ind1[~duplicate_classes]
-				class_ind2 = class_ind2[~duplicate_classes]
-
-				pts_allcombs0 = keypoints[ind1, :2]
-				pts_allcombs1 = keypoints[ind2, :2]
-
-				# This distance might be 0 for some combinations,
-				# as it can happen that there is more than one keypoint at a single location
-				dists = util.L2norm(pts_allcombs0 - pts_allcombs1)
-
-				original_dists = self.squareform[class_ind1, class_ind2]
-
-				# Coincident initial keypoints cannot provide a scale estimate.
-				valid_dists = original_dists > 0
-				scalechange = dists[valid_dists] / original_dists[valid_dists]
-
-				# Compute angles
-				angles = np.empty((pts_allcombs0.shape[0]))
-
-				v = pts_allcombs1 - pts_allcombs0
-				angles = np.arctan2(v[:, 1], v[:, 0])
-				
-				original_angles = self.angles[class_ind1, class_ind2]
-
-				angle_diffs = angles - original_angles
-
-				# Fix long way angles
-				long_way_angles = np.abs(angle_diffs) > math.pi
-
-				angle_diffs[long_way_angles] = angle_diffs[long_way_angles] - np.sign(angle_diffs[long_way_angles]) * 2 * math.pi
-
-				scale_estimate = median(scalechange) if scalechange.size else 1.0
-				if not self.estimate_scale:
-					scale_estimate = 1;
-
-				med_rot = median(angle_diffs)
-				if not self.estimate_rotation:
-					med_rot = 0;
-
-				keypoint_class = keypoints[:, 2].astype(int)
-				votes = keypoints[:, :2] - scale_estimate * (util.rotate(self.springs[keypoint_class - 1], med_rot))
-
-				# Remember all votes including outliers
-				self.votes = votes
-
-				# Compute pairwise distance between votes
-				pdist = scipy.spatial.distance.pdist(votes)
-
-				# Compute linkage between pairwise distances
-				linkage = scipy.cluster.hierarchy.linkage(pdist)
-
-				# Perform hierarchical distance-based clustering
-				T = scipy.cluster.hierarchy.fcluster(linkage, self.THR_OUTLIER, criterion='distance')
-
-				# Count votes for each cluster
-				cnt = np.bincount(T)  # Dummy 0 label remains
-				
-				# Get largest class
-				Cmax = argmax(cnt)
-
-				# Identify inliers (=members of largest class)
-				inliers = T == Cmax
-				# inliers = med_dists < THR_OUTLIER
-
-				# Remember outliers
-				self.outliers = keypoints[~inliers, :]
-
-				# Stop tracking outliers
-				keypoints = keypoints[inliers, :]
-
-				# Remove outlier votes
-				votes = votes[inliers, :]
-
-				# Compute object center
-				center = np.mean(votes, axis=0)
+				center, keypoints = self._vote_and_cluster(keypoints, scale_estimate, med_rot)
 
 		return (center, scale_estimate, med_rot, keypoints)
 
+	def _vote_and_cluster(self, keypoints, scale_estimate, med_rot):
+		with self.profile.stage('voting_clustering'):
+			keypoint_class = keypoints[:, 2].astype(int)
+			votes = keypoints[:, :2] - scale_estimate * (util.rotate(self.springs[keypoint_class - 1], med_rot))
+
+			# Remember all votes including outliers
+			self.votes = votes
+
+			# Compute pairwise distance between votes
+			pdist = scipy.spatial.distance.pdist(votes)
+
+			# Compute linkage between pairwise distances
+			linkage = scipy.cluster.hierarchy.linkage(pdist)
+
+			# Perform hierarchical distance-based clustering
+			T = scipy.cluster.hierarchy.fcluster(linkage, self.THR_OUTLIER, criterion='distance')
+
+			# Count votes for each cluster
+			cnt = np.bincount(T)  # Dummy 0 label remains
+
+			# Get largest class
+			Cmax = argmax(cnt)
+
+			# Identify inliers (=members of largest class)
+			inliers = T == Cmax
+			# inliers = med_dists < THR_OUTLIER
+
+			# Remember outliers
+			self.outliers = keypoints[~inliers, :]
+
+			# Stop tracking outliers
+			keypoints = keypoints[inliers, :]
+
+			# Remove outlier votes
+			votes = votes[inliers, :]
+
+			# Compute object center
+			center = np.mean(votes, axis=0)
+		return center, keypoints
+
 	def process_frame(self, im_gray):
 
-		tracked_keypoints, _ = util.track(self.im_prev, im_gray, self.active_keypoints)
+		self.profile.reset()
+		with self.profile.stage('optical_flow'):
+			tracked_keypoints, _ = util.track(self.im_prev, im_gray, self.active_keypoints)
+		tracked_count = len(tracked_keypoints)
 		(center, scale_estimate, rotation_estimate, tracked_keypoints) = self.estimate(tracked_keypoints)
 
 		# Detect keypoints, compute descriptors
-		keypoints_cv = self.detector.detect(im_gray) 
-		keypoints_cv, features = self.descriptor.compute(im_gray, keypoints_cv)
+		with self.profile.stage('brisk_detect'):
+			keypoints_cv = self.detector.detect(im_gray)
+		with self.profile.stage('brisk_describe'):
+			keypoints_cv, features = self.descriptor.compute(im_gray, keypoints_cv)
+		self.profile.features = dict(N=self.num_initial_keypoints,
+			B=len(self.features_database)-self.num_initial_keypoints,
+			D=len(self.features_database), Q=len(keypoints_cv), K=tracked_count)
 
-		# Create list of active keypoints
-		active_keypoints = zeros((0, 3)) 
-
-		# Get the best two matches for each feature
-		matches_all = (self.matcher.knnMatch(features, self.features_database, 2)
-			if features is not None else [])
-		# Get all matches for selected features
-		if not any(isnan(center)):
-			selected_matches_all = self.matcher.knnMatch(features, self.selected_features, len(self.selected_features))
-
-
-		# For each keypoint and its descriptor
-		if len(keypoints_cv) > 0:
-			transformed_springs = scale_estimate * util.rotate(self.springs, -rotation_estimate)
-			for i in range(len(keypoints_cv)):
-
-				# Retrieve keypoint location
-				location = np.array(keypoints_cv[i].pt)
-
-				# First: Match over whole image
-				# Compute distances to all descriptors
-				matches = matches_all[i]
-				if len(matches) < 2:
-					continue
-				distances = np.array([m.distance for m in matches])
-
-				# Convert distances to confidences, do not weight
-				combined = 1 - distances / self.DESC_LENGTH
-
-				classes = self.database_classes
-
-				# Get best and second best index
-				bestInd = matches[0].trainIdx
-				secondBestInd = matches[1].trainIdx
-
-				# Compute distance ratio according to Lowe
-				ratio = distances[0] / distances[1] if distances[1] else 1.0
-
-				# Extract class of best match
-				keypoint_class = classes[bestInd]
-
-				# If distance ratio is ok and absolute distance is ok and keypoint class is not background
-				if ratio < self.THR_RATIO and combined[0] > self.THR_CONF and keypoint_class != 0:
-
-					# Add keypoint to active keypoints
-					new_kpt = append(location, keypoint_class)
-					active_keypoints = append(active_keypoints, array([new_kpt]), axis=0)
-
-				# In a second step, try to match difficult keypoints
-				# If structural constraints are applicable
-				if not any(isnan(center)):
-
-					# Compute distances to initial descriptors
-					matches = selected_matches_all[i]				
-					distances = np.array([m.distance for m in matches])
-					# Re-order the distances based on indexing
-					idxs = np.argsort(np.array([m.trainIdx for m in matches]))
-					distances = distances[idxs]					
-
-					# Convert distances to confidences
-					confidences = 1 - distances / self.DESC_LENGTH
-
-					# Compute the keypoint location relative to the object center
-					relative_location = location - center
-
-					# Compute the distances to all springs
-					displacements = util.L2norm(transformed_springs - relative_location)
-
-					# For each spring, calculate weight
-					weight = displacements < self.THR_OUTLIER  # Could be smooth function
-
-					combined = weight * confidences
-
-					classes = self.selected_classes
-
-					# Sort in descending order
-					sorted_conf = argsort(combined)[::-1]  # reverse
-
-					# Get best and second best index
-					bestInd = sorted_conf[0]
-					secondBestInd = sorted_conf[1]
-
-					# Compute distance ratio according to Lowe
-					denominator = 1 - combined[secondBestInd]
-					ratio = (1 - combined[bestInd]) / denominator if denominator else 1.0
-
-					# Extract class of best match
-					keypoint_class = classes[bestInd]
-
-					# If distance ratio is ok and absolute distance is ok and keypoint class is not background
-					if ratio < self.THR_RATIO and combined[bestInd] > self.THR_CONF and keypoint_class != 0:
-
-						# Add keypoint to active keypoints
-						new_kpt = append(location, keypoint_class)
-
-						# Check whether same class already exists
-						if active_keypoints.size > 0:
-							same_class = np.nonzero(active_keypoints[:, 2] == keypoint_class)
-							active_keypoints = np.delete(active_keypoints, same_class, axis=0)
-
-						active_keypoints = append(active_keypoints, array([new_kpt]), axis=0)
+		with self.profile.stage('matching_reconciliation'):
+			if self.backend == 'cpu':
+				active_keypoints = self._match_cpu(features, keypoints_cv, center, scale_estimate, rotation_estimate)
+			else:
+				from gpu_matching import match_candidates, replay_events
+				positions = util.keypoints_cv_to_np(keypoints_cv)
+				transformed = scale_estimate * util.rotate(self.springs, -rotation_estimate)
+				events = match_candidates(self._backend, self._gpu_model,
+					np.empty((0, 64), dtype=np.uint8) if features is None else features,
+					positions, center, transformed, self.THR_OUTLIER, self.THR_CONF, self.THR_RATIO)
+				active_keypoints = replay_events(positions, events)
 
 		# If some keypoints have been tracked
 		if tracked_keypoints.size > 0:
@@ -391,3 +372,109 @@ class CMT(object):
 			self.br = br
 
 			self.bb = np.array([min_x, min_y, max_x - min_x, max_y - min_y])
+
+
+	def _match_cpu(self, features, keypoints_cv, center, scale_estimate, rotation_estimate):
+		# Create list of active keypoints
+		active_keypoints = zeros((0, 3))
+
+		# Get the best two matches for each feature
+		matches_all = (self.matcher.knnMatch(features, self.features_database, 2)
+			if features is not None else [])
+		# Get all matches for selected features
+		if not any(isnan(center)):
+			selected_matches_all = self.matcher.knnMatch(features, self.selected_features, len(self.selected_features))
+
+
+		# For each keypoint and its descriptor
+		if len(keypoints_cv) > 0:
+			transformed_springs = scale_estimate * util.rotate(self.springs, -rotation_estimate)
+			for i in range(len(keypoints_cv)):
+
+				# Retrieve keypoint location
+				location = np.array(keypoints_cv[i].pt)
+
+				# First: Match over whole image
+				# Compute distances to all descriptors
+				matches = matches_all[i]
+				if len(matches) < 2:
+					continue
+				distances = np.array([m.distance for m in matches])
+
+				# Convert distances to confidences, do not weight
+				combined = 1 - distances / self.DESC_LENGTH
+
+				classes = self.database_classes
+
+				# Get best and second best index
+				bestInd = matches[0].trainIdx
+				secondBestInd = matches[1].trainIdx
+
+				# Compute distance ratio according to Lowe
+				ratio = distances[0] / distances[1] if distances[1] else 1.0
+
+				# Extract class of best match
+				keypoint_class = classes[bestInd]
+
+				# If distance ratio is ok and absolute distance is ok and keypoint class is not background
+				if ratio < self.THR_RATIO and combined[0] > self.THR_CONF and keypoint_class != 0:
+
+					# Add keypoint to active keypoints
+					new_kpt = append(location, keypoint_class)
+					active_keypoints = append(active_keypoints, array([new_kpt]), axis=0)
+
+				# In a second step, try to match difficult keypoints
+				# If structural constraints are applicable
+				if not any(isnan(center)):
+
+					# Compute distances to initial descriptors
+					matches = selected_matches_all[i]
+					distances = np.array([m.distance for m in matches])
+					# Re-order the distances based on indexing
+					idxs = np.argsort(np.array([m.trainIdx for m in matches]))
+					distances = distances[idxs]
+
+					# Convert distances to confidences
+					confidences = 1 - distances / self.DESC_LENGTH
+
+					# Compute the keypoint location relative to the object center
+					relative_location = location - center
+
+					# Compute the distances to all springs
+					displacements = util.L2norm(transformed_springs - relative_location)
+
+					# For each spring, calculate weight
+					weight = displacements < self.THR_OUTLIER  # Could be smooth function
+
+					combined = weight * confidences
+
+					classes = self.selected_classes
+
+					# Sort in descending order
+					sorted_conf = argsort(combined)[::-1]  # reverse
+
+					# Get best and second best index
+					bestInd = sorted_conf[0]
+					secondBestInd = sorted_conf[1]
+
+					# Compute distance ratio according to Lowe
+					denominator = 1 - combined[secondBestInd]
+					ratio = (1 - combined[bestInd]) / denominator if denominator else 1.0
+
+					# Extract class of best match
+					keypoint_class = classes[bestInd]
+
+					# If distance ratio is ok and absolute distance is ok and keypoint class is not background
+					if ratio < self.THR_RATIO and combined[bestInd] > self.THR_CONF and keypoint_class != 0:
+
+						# Add keypoint to active keypoints
+						new_kpt = append(location, keypoint_class)
+
+						# Check whether same class already exists
+						if active_keypoints.size > 0:
+							same_class = np.nonzero(active_keypoints[:, 2] == keypoint_class)
+							active_keypoints = np.delete(active_keypoints, same_class, axis=0)
+
+						active_keypoints = append(active_keypoints, array([new_kpt]), axis=0)
+
+		return active_keypoints

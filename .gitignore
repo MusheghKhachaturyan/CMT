@@ -6,4 +6,6 @@
 __pycache__/
 demo/
 output/
-
+.venv-gpu/
+.cupy-cache/
+benchmark-results/

@@ -75,15 +75,113 @@ passthrough. A video file works without a camera.
 
 ## CPU / GPU
 
-This implementation runs tracking on the **CPU**. It uses BRISK features,
-Hamming descriptor matching, Lucas–Kanade optical flow, NumPy arrays, and SciPy
-clustering. It does not use `cv2.cuda`, CUDA device memory, PyTorch, or CuPy, and
-there is no GPU command-line switch. Having an NVIDIA GPU or installing CUDA
-does not move this algorithm to the GPU. GPU acceleration would require code
-changes and an appropriate GPU-enabled OpenCV build.
+CPU tracking remains the default and does not import CuPy. The optional hybrid
+CuPy backend accelerates packed BRISK descriptor matching, structural scoring,
+and ordered-pair scale/rotation estimation. BRISK detection/description,
+Lucas–Kanade optical flow, voting, SciPy clustering, and input/output stay on the
+CPU. A CUDA-enabled OpenCV build is not required.
 
-The compatibility updates in this checkout support Python 3 and OpenCV 4;
-the original upstream implementation targeted Python 2 and OpenCV 2.4.
+**The CuPy backend is experimental. CUDA correctness, memory stability, and
+speed have not been verified on this machine.** WSL currently reports blocked
+GPU access, and CuPy is absent. CPU/NumPy expression checks do not establish
+CUDA support or acceleration.
+
+```bash
+# Existing CPU behavior.
+python run.py demo/input.avi --bbox=50,50,100,80 --quiet
+
+# Explicit hybrid backend; initialization errors are fatal.
+python run.py demo/input.avi --bbox=50,50,100,80 --quiet --backend cupy --device 0
+
+# Availability selection at startup, with a visible CPU fallback reason.
+python run.py demo/input.avi --bbox=50,50,100,80 --quiet --backend auto
+```
+
+`--gpu-memory-mb` sets the temporary GPU workspace budget (default 256 MiB).
+Persistent descriptors and reference tables are checked separately against
+available device memory. Matching uses bounded tiles. Exact pair medians need
+quadratic storage: when the conservative geometry preflight exceeds the budget,
+the existing CPU estimator runs and reports the route. For the laptop workload,
+the default budget can route geometry to CPU; use a larger budget, such as
+`--gpu-memory-mb 512`, if the device has room. There is no pair sampling, feature
+cap, or runtime recovery from CUDA execution errors. `auto` does not tune speed;
+select CPU explicitly for small workloads that run faster there.
+
+Python callers can use `CMT(backend='cupy', device=0, gpu_memory_mb=256)`.
+All published results remain host NumPy arrays. Enable detailed synchronized
+wall-clock measurements with `tracker.profile.enabled = True` or `--profile`.
+The CLI writes JSON stage records to stderr; nested stage times overlap.
+`--quiet` continues to suppress windows while retaining drawing, output, and
+frame summaries.
+
+### GPU environment and validation
+
+First establish GPU access in the same WSL/container environment using
+`nvidia-smi`. Preserve the original `.venv`; create a separate GPU environment:
+
+```bash
+python3 -m venv .venv-gpu
+source .venv-gpu/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements-gpu.txt
+python -m pip check
+export CUPY_CACHE_DIR="$PWD/.cupy-cache"
+python tests/run_gpu_validation.py
+# Save a tested lock only AFTER the CUDA validation run succeeds.
+python -m pip freeze > requirements-gpu-tested.lock
+```
+
+The optional requirements choose CUDA 12 CuPy with CUDA component wheels and
+constrain NumPy/SciPy to the documented CuPy 14 test ranges. They are an
+installation recipe, not a validated lock. This environment could not resolve
+them during implementation, so no tested GPU lock is supplied. For a CUDA 13
+installation, install `cupy-cuda13x[ctk]>=14.2,<15` with `requirements.txt` and
+`constraints-gpu.txt` instead. Install exactly one CuPy distribution. A compatible
+NVIDIA driver is required even with component wheels. See the official
+[CuPy installation instructions](https://docs.cupy.dev/en/stable/install.html).
+
+The ordinary suite clearly skips CUDA checks without a usable backend. The
+release runner fails if CUDA startup fails or any tests are skipped. Startup
+itself executes the actual Hamming/structural and median geometry operations,
+including device allocation, generated kernels, and transfers.
+
+### Reproducible benchmarks
+
+```bash
+python benchmarks/benchmark_tracking.py demo/IMG_3542.MOV \
+  --bbox=0,520,325,238 --with-rotation --backends cpu,cupy \
+  --repeats 3 --output benchmark-results/laptop.json
+
+python benchmarks/benchmark_tracking.py demo/input.avi \
+  --bbox=50,50,100,80 --backends cpu,cupy --repeats 3 \
+  --application-output benchmark-results/demo-output \
+  --output benchmark-results/demo.json
+```
+
+Each backend warms a disposable tracker, then starts fresh trackers at the
+original initialization frame for measured runs. Reports record dependency
+versions, thread count, input checksum, startup/initialization, median/p95 frame
+latency, throughput, feature counts, pool memory, geometry routes, and outputs.
+Pool memory is sampled at frame boundaries: reserved memory retains temporary
+allocations, while live temporary allocation peaks are not measured. Tracker
+throughput includes CPU stages and transfers; application throughput
+also includes decoding and optional PNG/CSV output. A separate instrumented
+sample (first 30 tracking frames by default) records stage/transfer costs and is
+excluded from throughput measurements. Its nested times must not be added.
+
+Use `--max-frames N` for a smoke run; reports mark it incomplete. Use
+`--opencv-threads N` to fix thread settings across runs. CPU and CuPy comparisons
+must use the same resolved environment. The harness synchronizes GPU work at
+measurement boundaries, following
+[CuPy performance guidance](https://docs.cupy.dev/en/stable/user_guide/performance.html).
+Available CPU/CuPy runs compare result flags, ordered class signatures, poses,
+and floating corners before allowing a one-pixel integer-corner difference.
+Unavailable backends are recorded as failures and produce a nonzero exit status;
+completed CPU results are retained. The target is 1.25× warmed tracker throughput
+on the full laptop video over at least three runs, after correctness validation.
+Until measured CUDA results meet that target, this backend remains experimental.
+See [the validation record](benchmarks/VALIDATION.md) for the current CPU
+baseline and unresolved GPU environment checks.
 
 ## Validation
 
@@ -101,7 +199,8 @@ sequence runner.
 ```
 usage: run.py [-h] [--challenge] [--preview] [--no-preview] [--no-scale]
                [--with-rotation] [--bbox BBOX] [--pause] [--output-dir OUTPUT]
-               [--quiet] [--skip SKIP]
+               [--quiet] [--skip SKIP] [--backend {cpu,cupy,auto}]
+               [--device DEVICE] [--gpu-memory-mb GPU_MEMORY_MB] [--profile]
                [inputpath]
 ```
 
