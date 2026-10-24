@@ -10,8 +10,9 @@ def workspace_bytes(keypoints, scale=True, rotation=True):
     if not pairs or not (scale or rotation):
         return 0
     # Conservative live-array bound: mask, indices, gathered coordinates and
-    # references, float64 arithmetic, compacted values and median sort scratch.
-    return 65536 + k * 64 + k * k * 16 + pairs * 192
+    # references, float64 arithmetic, compacted values and median sort scratch
+    # (measured peak 73 bytes per pair; 112 budgeted).
+    return 65536 + k * 64 + k * k * 16 + pairs * 112
 
 
 def pair_pose(backend, model, sorted_keypoints, estimate_scale, estimate_rotation):

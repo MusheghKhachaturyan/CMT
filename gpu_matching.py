@@ -10,12 +10,16 @@ POPCOUNT = np.array([i.bit_count() for i in range(256)], dtype=np.uint8)
 
 def tile_shape(queries, database, budget):
     # Covers two byte tensors, reductions, float64 XY/sqrt scoring, masks,
-    # indices, reduction scratch and per-query candidate/transfer storage.
+    # indices, reduction scratch and per-query candidate/transfer storage
+    # (measured peak 130-163 bytes per tile element; 256 budgeted).
+    # Tiles are as large as the budget allows, whole database first: every
+    # tile costs dozens of kernel launches, which dominate small tiles.
     usable = budget - queries * 192 - 65536
     if usable < 256:
         raise BackendError("GPU matching workspace too small for query buffers; increase --gpu-memory-mb")
-    columns = min(database, 256, max(1, usable // 256))
-    rows = min(queries, 128, max(1, usable // (columns * 256)))
+    elements = usable // 256
+    columns = min(database, elements)
+    rows = min(queries, max(1, elements // columns))
     return rows, columns
 
 
@@ -104,13 +108,20 @@ def match_candidates(backend, model, features, positions, center, transformed_sp
 
 
 def replay_events(positions, events):
-    """Literal legacy event replay; deliberately retains duplicate global rows."""
-    active = np.zeros((0, 3))
-    for location, (global_class, structural_class) in zip(positions, events):
-        if global_class:
-            active = np.append(active, [np.append(location, global_class)], axis=0)
-        if structural_class:
-            if active.size:
-                active = np.delete(active, np.nonzero(active[:, 2] == structural_class), axis=0)
-            active = np.append(active, [np.append(location, structural_class)], axis=0)
-    return active
+    """Legacy event replay; deliberately retains duplicate global rows.
+
+    Events are visited per query as (global, structural). The legacy loop
+    appends each nonzero event and lets a structural event delete every earlier
+    row of its class, so a row survives unless a later structural event shares
+    its class. Rows keep their append order.
+    """
+    events = np.asarray(events, dtype=np.int64).reshape(-1)  # g0, s0, g1, s1, ...
+    if not events.size:
+        return np.zeros((0, 3))
+    order = np.arange(events.size)
+    structural = (order % 2 == 1) & (events != 0)
+    last_structural = np.full(events.max() + 1, -1)
+    np.maximum.at(last_structural, events[structural], order[structural])
+    keep = (events != 0) & (order >= last_structural[events])
+    locations = np.asarray(positions, dtype=float).reshape(-1, 2)[order[keep] // 2]
+    return np.column_stack((locations, events[keep])).astype(float)

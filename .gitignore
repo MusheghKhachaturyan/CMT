@@ -9,3 +9,5 @@ output/
 .venv-gpu/
 .cupy-cache/
 benchmark-results/
+.claude/
+benchmarks/

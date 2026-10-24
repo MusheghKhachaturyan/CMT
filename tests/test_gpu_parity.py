@@ -39,6 +39,58 @@ class GPUNumericalTests(NumericalCases, unittest.TestCase):
             samples.append(self.backend.memory()['reserved_bytes'])
         self.assertLessEqual(max(samples[-20:]),max(samples[20:40])+2*1024**2)
 
+    def peak_bytes(self,function,*args):
+        """Peak live pool allocation during a warm call (excludes one-off caches)."""
+        from cupy.cuda.memory_hook import MemoryHook
+
+        class Peak(MemoryHook):
+            name='peak'
+            current=peak=0
+
+            def malloc_postprocess(self,device_id,size,mem_size,mem_ptr,pmem_id):
+                self.current+=mem_size;self.peak=max(self.peak,self.current)
+
+            def free_postprocess(self,device_id,mem_size,mem_ptr,pmem_id):
+                self.current-=mem_size
+
+        function(*args)
+        hook=Peak()
+        with hook:function(*args)
+        return hook.peak
+
+    def test_geometry_workspace_estimate_bounds_peak(self):
+        from test_numerics import model
+        from gpu_geometry import pair_pose, workspace_bytes
+        rng=np.random.default_rng(3)
+        for k,duplicates in ((50,False),(557,False),(1250,False),(600,True)):
+            ref=rng.uniform(0,300,(k,2))
+            m=model(self.backend,np.zeros((k,64),np.uint8),k,reference=ref)
+            classes=rng.integers(1,k//3+1,k) if duplicates else np.arange(1,k+1)
+            points=np.column_stack((ref[classes-1]+rng.normal(0,1,(k,2)),classes))[np.argsort(classes)]
+            with self.subTest(k=k,duplicates=duplicates):
+                self.assertLessEqual(self.peak_bytes(pair_pose,self.backend,m,points,True,True),workspace_bytes(points))
+
+    def test_matching_tiles_stay_within_budget(self):
+        from test_numerics import model
+        from gpu_matching import match_candidates, tile_shape
+        rng=np.random.default_rng(4)
+        d,n=800,500
+        db=rng.integers(0,256,(d,64),dtype=np.uint8)
+        m=model(self.backend,db,n)
+        springs=rng.normal(0,60,(n,2))
+        original=self.backend.workspace_bytes
+        try:
+            # Several row tiles; then several row and column tiles.
+            for q,budget in ((600,32*1024**2),(120,200*1024)):
+                self.backend.workspace_bytes=budget
+                query=rng.integers(0,256,(q,64),dtype=np.uint8)
+                positions=rng.uniform(0,600,(q,2))
+                peak=self.peak_bytes(match_candidates,self.backend,m,query,positions,[300.,300.],springs,20,.75,.8)
+                with self.subTest(tile=tile_shape(q,d,budget-n*16-16)):
+                    self.assertLessEqual(peak,budget)
+        finally:
+            self.backend.workspace_bytes=original
+
 
 class GPUTrackingTests(_TrackingTests):
     tracker_backend='cupy'

@@ -40,6 +40,25 @@ python -m pip install -r requirements.txt
 python run.py --help
 ```
 
+Optional GPU environment, for the CuPy backend (see [CPU / GPU](#cpu--gpu)). It
+needs an NVIDIA GPU visible in `nvidia-smi` and a driver supporting CUDA 12.
+Keep `.venv` as it is and create a separate `.venv-gpu`; `requirements-gpu.txt`
+also installs everything from `requirements.txt`:
+
+```bash
+nvidia-smi
+python3 -m venv .venv-gpu
+source .venv-gpu/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements-gpu.txt
+python -m pip check
+python -c "import cupy; print(cupy.cuda.runtime.getDeviceCount(), 'CUDA device(s)')"
+```
+
+From `.venv-gpu`, every command below also works with `--backend cupy` added.
+For a CUDA 13 driver, install `cupy-cuda13x[ctk]>=14.2,<15` with
+`requirements.txt` and `constraints-gpu.txt` instead of `requirements-gpu.txt`.
+
 Create and track a sample video without a camera or display:
 
 ```bash
@@ -81,10 +100,7 @@ and ordered-pair scale/rotation estimation. BRISK detection/description,
 Lucas–Kanade optical flow, voting, SciPy clustering, and input/output stay on the
 CPU. A CUDA-enabled OpenCV build is not required.
 
-**The CuPy backend is experimental. CUDA correctness, memory stability, and
-speed have not been verified on this machine.** WSL currently reports blocked
-GPU access, and CuPy is absent. CPU/NumPy expression checks do not establish
-CUDA support or acceleration.
+
 
 ```bash
 # Existing CPU behavior.
@@ -116,15 +132,11 @@ frame summaries.
 
 ### GPU environment and validation
 
-First establish GPU access in the same WSL/container environment using
-`nvidia-smi`. Preserve the original `.venv`; create a separate GPU environment:
+Create `.venv-gpu` as described in
+[Setup and quick start](#setup-and-quick-start-linux--wsl), then validate it:
 
 ```bash
-python3 -m venv .venv-gpu
 source .venv-gpu/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements-gpu.txt
-python -m pip check
 export CUPY_CACHE_DIR="$PWD/.cupy-cache"
 python tests/run_gpu_validation.py
 # Save a tested lock only AFTER the CUDA validation run succeeds.
